@@ -79,7 +79,7 @@ func (rf *Raft) startReplication(term int) bool {
 			if reply.ConflictTerm == InvalidTerm {
 				rf.nextIndex[peer] = reply.ConflictIndex
 			} else {
-				firstTermIndex := rf.firstLogFor(reply.ConflictTerm)
+				firstTermIndex := rf.log.firstFor(reply.ConflictTerm)
 				if firstTermIndex != InvalidIndex {
 					rf.nextIndex[peer] = firstTermIndex
 				} else {
@@ -88,6 +88,13 @@ func (rf *Raft) startReplication(term int) bool {
 			}
 			// avoid the late reply move the nextIndex forward again
 			rf.nextIndex[peer] = min(prevNext, rf.nextIndex[peer])
+
+			nextPrevIndex := rf.nextIndex[peer] - 1
+			nextPrevTerm := InvalidTerm
+			if nextPrevIndex >= rf.log.snapLastIdx {
+				nextPrevTerm = rf.log.at(nextPrevIndex).Term
+			}
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at Prev=[%d]T%d, Try next Prev=[%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, nextPrevIndex, nextPrevTerm)
 			return
 		}
 
@@ -98,8 +105,7 @@ func (rf *Raft) startReplication(term int) bool {
 		// 更新 commitIndex
 		majorityMatched := rf.getMajorityIndexLocked()
 
-		
-		if majorityMatched > rf.commitIndex && rf.log[majorityMatched].Term == rf.currentTerm {
+		if majorityMatched > rf.commitIndex && rf.log.at(majorityMatched).Term == rf.currentTerm {
 			LOG(rf.me, rf.currentTerm, DApply, "Leader Update the commit index %d->%d", rf.commitIndex, args.LeaderCommit)
 			rf.commitIndex = majorityMatched
 			rf.applyCond.Signal()
@@ -118,21 +124,37 @@ func (rf *Raft) startReplication(term int) bool {
 	// 给所有节点发送 RPC
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
-			rf.matchIndex[peer] = len(rf.log) - 1
-			rf.nextIndex[peer] = len(rf.log)
+			rf.matchIndex[peer] = rf.log.size() - 1
+			rf.nextIndex[peer] = rf.log.size()
 			continue
 		}
 
 		// 所期望的前一条日志
 		prevIdx := rf.nextIndex[peer] - 1
-		prevTerm := rf.log[prevIdx].Term
+		// 如果 prevIdx 不存在，先发 snapshot 过去
+		if prevIdx < rf.log.snapLastIdx {
+			args := &InstallSnapshotArgs{
+				Term:             rf.currentTerm,
+				LeaderId:         rf.me,
+				LastIncludeIndex: rf.log.snapLastIdx,
+				LastIncludeTerm:  rf.log.snapLastTerm,
+				Snapshot:         rf.log.snapshot,
+			}
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, SendSnap, Args=%v", peer, args.String())
+			go rf.installToPeer(peer, term, args)
+			// 如果发送了一个 InstallRPC 就不用再发 AppendEntry RPC 了
+			continue
+		}
+
+		prevTerm := rf.log.at(prevIdx).Term
 		args := &AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     rf.me,
 			PrevLogIndex: prevIdx,
 			PrevLogTerm:  prevTerm,
 			// Entries:      rf.log[prevIdx+1:],
-			Entries:      append([]LogEntry(nil), rf.log[prevIdx+1:]...),
+			// Entries:      append([]LogEntry(nil), rf.log[prevIdx+1:]...),
+			Entries:      rf.log.tail(prevIdx + 1),
 			LeaderCommit: rf.commitIndex,
 		}
 
@@ -175,19 +197,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.resetElectionTimerLocked()
 
 	// 如果 Leader 的 prevLog 和 peer 本地没有匹配上
-	if args.PrevLogIndex >= len(rf.log) {
-		reply.ConflictIndex = len(rf.log)
+	if args.PrevLogIndex >= rf.log.size() {
+		reply.ConflictIndex = rf.log.size()
 		reply.ConflictTerm = InvalidTerm
 		return
 	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
-		reply.ConflictIndex = rf.firstLogFor(reply.ConflictTerm)
+	if rf.log.at(args.PrevLogIndex).Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log.at(args.PrevLogIndex).Term
+		reply.ConflictIndex = rf.log.firstFor(reply.ConflictTerm)
 		return
 	}
 
 	// 把参数中的 entries append 到本地
-	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.log.appendFrom(args.PrevLogIndex, args.Entries)
 	rf.persistLocked()
 	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
 

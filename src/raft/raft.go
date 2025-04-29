@@ -87,7 +87,8 @@ type Raft struct {
 
 	electionStart   time.Time     // 每次选举计算时间点
 	electionTimeout time.Duration // 超时随机间隔
-	log             []LogEntry    // 每个 peer 本地的日志
+	// log             []LogEntry    // 每个 peer 本地的日志
+	log *RaftLog
 
 	// Leader 才会使用，每个 peer 的视图
 	nextIndex  []int
@@ -95,8 +96,9 @@ type Raft struct {
 
 	// Volatile state on all servers
 	// apply 字段
-	applyCh   chan ApplyMsg
-	applyCond *sync.Cond
+	applyCh     chan ApplyMsg
+	applyCond   *sync.Cond
+	snapPending bool
 
 	commitIndex int
 	lastApplied int
@@ -141,20 +143,9 @@ func (rf *Raft) becomeLeaderLocked() {
 		rf.role, rf.currentTerm)
 	rf.role = Leader
 	for peer := range rf.peers {
-		rf.nextIndex[peer] = len(rf.log)
+		rf.nextIndex[peer] = rf.log.size()
 		rf.matchIndex[peer] = 0
 	}
-}
-
-func (rf *Raft) firstLogFor(term int) int {
-	for i, entry := range rf.log {
-		if entry.Term == term {
-			return i
-		} else if entry.Term > term {
-			break
-		}
-	}
-	return InvalidIndex
 }
 
 // return currentTerm and whether this server
@@ -164,15 +155,6 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.role == Leader
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (PartD).
-
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -224,15 +206,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.role != Leader {
 		return 0, 0, false
 	}
-	rf.log = append(rf.log, LogEntry{
+	rf.log.append(LogEntry{
 		CommandValid: true,
 		Command:      command,
 		Term:         rf.currentTerm,
 	})
 	rf.persistLocked()
-	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", len(rf.log)-1, rf.currentTerm)
+	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", rf.log.size()-1, rf.currentTerm)
 
-	return len(rf.log) - 1, rf.currentTerm, true
+	return rf.log.size() - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -279,11 +261,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.currentTerm = 1
 	rf.votedFor = -1
-	rf.log = append(rf.log, LogEntry{
-		Term: InvalidTerm,
-	}) // 添加一个 dummy 头节点
+	// rf.log = append(rf.log, LogEntry{
+	// 	Term: InvalidTerm,
+	// }) // 添加一个 dummy 头节点
+	rf.log = NewLog(InvalidIndex, InvalidTerm, nil, nil)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.snapPending = false
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
 

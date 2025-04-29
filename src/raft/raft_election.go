@@ -19,8 +19,7 @@ func (rf *Raft) isElectionTimeoutLocked() bool {
 
 // 作为 peer 收到 Candidate RPC 比较日志谁更新
 func (rf *Raft) isMoreUpDateLocked(candidateIndex, candidateTerm int) bool {
-	l := len(rf.log)
-	lastIndex, lastTerm := l-1, rf.log[l-1].Term
+	lastIndex, lastTerm := rf.log.last()
 
 	LOG(rf.me, rf.currentTerm, DVote, "Compare last log, Me: [%d]T%d, Candidate: [%d]T%d", lastIndex, lastTerm, candidateIndex, candidateTerm)
 	if lastTerm != candidateTerm {
@@ -141,7 +140,7 @@ func (rf *Raft) startElection(term int) bool {
 		return false
 	}
 
-	l := len(rf.log)
+	lastIdx, lastTerm := rf.log.last()
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
 			votes++
@@ -151,8 +150,8 @@ func (rf *Raft) startElection(term int) bool {
 		args := &RequestVoteArgs{
 			Term:         term,
 			CandidateId:  rf.me,
-			LastLogIndex: l - 1,
-			LastLogTerm:  rf.log[l-1].Term,
+			LastLogIndex: lastIdx,
+			LastLogTerm:  lastTerm,
 		}
 		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, AskVote, %v", args.String())
 		go askVoteFromPeer(peer, args)

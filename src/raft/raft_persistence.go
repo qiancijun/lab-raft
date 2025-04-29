@@ -7,7 +7,7 @@ import (
 )
 
 func (rf *Raft) persistString() string {
-	return fmt.Sprintf("T%d, VotedFor: %d, Log: [0: %d)", rf.currentTerm, rf.votedFor, len(rf.log))
+	return fmt.Sprintf("T%d, VotedFor: %d, Log: [0: %d)", rf.currentTerm, rf.votedFor, rf.log.size())
 }
 
 func (rf *Raft) persistLocked() {
@@ -15,10 +15,10 @@ func (rf *Raft) persistLocked() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
+	rf.log.persist(e)
 	raftstate := w.Bytes()
 	// leave the second parameter nil, will use it in PartD
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.log.snapshot)
 }
 
 func (rf *Raft) readPersist(data []byte) {
@@ -28,7 +28,6 @@ func (rf *Raft) readPersist(data []byte) {
 
 	var currentTerm int
 	var votedFor int
-	var log []LogEntry
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -44,10 +43,16 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	rf.votedFor = votedFor
 
-	if err := d.Decode(&log); err != nil {
+	if err := rf.log.readPersist(d); err != nil {
 		LOG(rf.me, rf.currentTerm, DPersist, "Read log error: %v", err)
 		return
 	}
-	rf.log = log
+	rf.log.snapshot = rf.persister.ReadSnapshot()
+
+	// 加载 snapshot，就代表已经提交了 commit
+	if rf.log.snapLastIdx > rf.commitIndex {
+		rf.commitIndex = rf.log.snapLastIdx
+		rf.lastApplied = rf.log.snapLastIdx
+	}
 	LOG(rf.me, rf.currentTerm, DPersist, "Read Persist %v", rf.persistString())
 }
