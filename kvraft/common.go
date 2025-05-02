@@ -1,9 +1,16 @@
 package kvraft
 
+import (
+	"fmt"
+	"log"
+	"time"
+)
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrTimeout     = "ErrTimeout"
 )
 
 type Err string
@@ -16,6 +23,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientId int64
+	SeqId    int64
 }
 
 type PutAppendReply struct {
@@ -30,4 +39,55 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+const ClientRequestTimeout = 500 * time.Millisecond
+
+const Debug = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+type Op struct {
+	// Your definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+	Key      string
+	Value    string
+	ClientId int64
+	SeqId    int64
+	OpType   OperationType
+}
+
+type OpReply struct {
+	Value string
+	Err   Err
+}
+
+type OperationType uint8
+
+const (
+	OpGet OperationType = iota
+	OpPut
+	OpAppend
+)
+
+func getOperationType(v string) OperationType {
+	switch v {
+	case "Put":
+		return OpPut
+	case "Append":
+		return OpAppend
+	default:
+		panic(fmt.Sprintf("unknown operation type %s", v))
+	}
+}
+
+type LastOperationInfo struct {
+	SeqId int64
+	Reply *OpReply
 }
