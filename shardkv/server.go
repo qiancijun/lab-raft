@@ -2,14 +2,14 @@ package shardkv
 
 import (
 	"bytes"
-	"course/labgob"
 	"course/labrpc"
-	"course/raft"
 	"course/shardctrler"
-	"sync"
 	"sync/atomic"
 	"time"
 )
+import "course/raft"
+import "sync"
+import "course/labgob"
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -22,25 +22,19 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	dead        int32
-	lastApplied int // 记录上一次 Apply 到哪里了，避免消息重复 apply
-	shards      map[int]*MemoryKVStateMachine
-	notifyChans map[int]chan *OpReply
-	// 去重表 key: ClientId, value: 对应的返回值
+	dead           int32
+	lastApplied    int
+	shards         map[int]*MemoryKVStateMachine
+	notifyChans    map[int]chan *OpReply
 	duplicateTable map[int64]LastOperationInfo
 	currentConfig  shardctrler.Config
 	prevConfig     shardctrler.Config
 	mck            *shardctrler.Clerk
 }
 
-func (kv *ShardKV) matchGroup(key string) bool {
-	shard := key2shard(key)
-	return kv.currentConfig.Shards[shard] == kv.gid
-}
-
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	// 判断请求 key 是否属于当前 group
+	// 判断请求 key 是否属于当前 Group
 	kv.mu.Lock()
 	if !kv.matchGroup(args.Key) {
 		reply.Err = ErrWrongGroup
@@ -49,12 +43,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	kv.mu.Unlock()
 
+	// 调用 raft，将请求存储到 raft 日志中并进行同步
 	index, _, isLeader := kv.rf.Start(RaftCommand{
-		ClientOperation,
+		ClientOpeartion,
 		Op{Key: args.Key, OpType: OpGet},
 	})
 
-	// 如果不是 Leader，让客户端去重试
+	// 如果不是 Leader 的话，直接返回错误
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -73,12 +68,17 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrTimeout
 	}
 
-	// 处理完 channel 就没有用了，可以异步的去删除
 	go func() {
 		kv.mu.Lock()
 		kv.removeNotifyChannel(index)
 		kv.mu.Unlock()
 	}()
+}
+
+func (kv *ShardKV) matchGroup(key string) bool {
+	shard := key2shard(key)
+	shardStatus := kv.shards[shard].Status
+	return kv.currentConfig.Shards[shard] == kv.gid && (shardStatus == Normal || shardStatus == GC)
 }
 
 func (kv *ShardKV) requestDuplicated(clientId, seqId int64) bool {
@@ -88,36 +88,38 @@ func (kv *ShardKV) requestDuplicated(clientId, seqId int64) bool {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	// 判断请求 key 是否属于当前 group
 	kv.mu.Lock()
+
+	// 判断请求 key 是否所属当前 Group
 	if !kv.matchGroup(args.Key) {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
 	}
-	kv.mu.Unlock()
-	// 判断请求是否是一个重复的请求
-	kv.mu.Lock()
+
+	// 判断请求是否重复
 	if kv.requestDuplicated(args.ClientId, args.SeqId) {
-		// 重复请求，直接把结果拿出来
-		opRelpy := kv.duplicateTable[args.ClientId].Reply
-		reply.Err = opRelpy.Err
+		// 如果是重复请求，直接返回结果
+		opReply := kv.duplicateTable[args.ClientId].Reply
+		reply.Err = opReply.Err
 		kv.mu.Unlock()
 		return
 	}
 	kv.mu.Unlock()
 
+	// 调用 raft，将请求存储到 raft 日志中并进行同步
 	index, _, isLeader := kv.rf.Start(RaftCommand{
-		ClientOperation,
+		ClientOpeartion,
 		Op{
 			Key:      args.Key,
 			Value:    args.Value,
+			OpType:   getOperationType(args.Op),
 			ClientId: args.ClientId,
 			SeqId:    args.SeqId,
-			OpType:   getOperationType(args.Op),
 		},
 	})
 
+	// 如果不是 Leader 的话，直接返回错误
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -135,6 +137,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrTimeout
 	}
 
+	// 删除通知的 channel
 	go func() {
 		kv.mu.Lock()
 		kv.removeNotifyChannel(index)
@@ -142,7 +145,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}()
 }
 
-// the tester calls Kill() when a ShardKV instance won't
+// Kill the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
 // and a killed() method to test rf.dead in
@@ -161,7 +164,7 @@ func (kv *ShardKV) killed() bool {
 	return z == 1
 }
 
-// servers[] contains the ports of the servers in this group.
+// StartServer servers[] contains the ports of the servers in this group.
 //
 // me is the index of the current server in servers[].
 //
@@ -191,6 +194,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(RaftCommand{})
+	labgob.Register(shardctrler.Config{})
+	labgob.Register(ShardOperationArgs{})
+	labgob.Register(ShardOperationReply{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -215,12 +222,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.currentConfig = shardctrler.DefaultConfig()
 	kv.prevConfig = shardctrler.DefaultConfig()
 
-	// 从 snapshot 中恢复数据
+	// 从 snapshot 中恢复状态
 	kv.restoreFromSnapshot(persister.ReadSnapshot())
 
 	go kv.applyTask()
 	go kv.fetchConfigTask()
-
+	go kv.shardMigrationTask()
+	go kv.shardGCTask()
 	return kv
 }
 
@@ -235,10 +243,7 @@ func (kv *ShardKV) applyToStateMachine(op Op, shardId int) *OpReply {
 	case OpAppend:
 		err = kv.shards[shardId].Append(op.Key, op.Value)
 	}
-	return &OpReply{
-		Value: value,
-		Err:   err,
-	}
+	return &OpReply{Value: value, Err: err}
 }
 
 func (kv *ShardKV) getNotifyChannel(index int) chan *OpReply {
@@ -257,11 +262,18 @@ func (kv *ShardKV) makeSnapshot(index int) {
 	enc := labgob.NewEncoder(buf)
 	_ = enc.Encode(kv.shards)
 	_ = enc.Encode(kv.duplicateTable)
+	_ = enc.Encode(kv.currentConfig)
+	_ = enc.Encode(kv.prevConfig)
 	kv.rf.Snapshot(index, buf.Bytes())
 }
 
 func (kv *ShardKV) restoreFromSnapshot(snapshot []byte) {
 	if len(snapshot) == 0 {
+		for i := 0; i < shardctrler.NShards; i++ {
+			if _, ok := kv.shards[i]; !ok {
+				kv.shards[i] = NewMemoryKVStateMachine()
+			}
+		}
 		return
 	}
 
@@ -269,10 +281,17 @@ func (kv *ShardKV) restoreFromSnapshot(snapshot []byte) {
 	dec := labgob.NewDecoder(buf)
 	var stateMachine map[int]*MemoryKVStateMachine
 	var dupTable map[int64]LastOperationInfo
-	if dec.Decode(&stateMachine) != nil || dec.Decode(&dupTable) != nil {
-		panic("failed to restore state from snapshot")
+	var currentConfig shardctrler.Config
+	var prevConfig shardctrler.Config
+	if dec.Decode(&stateMachine) != nil ||
+		dec.Decode(&dupTable) != nil ||
+		dec.Decode(&currentConfig) != nil ||
+		dec.Decode(&prevConfig) != nil {
+		panic("failed to restore state from snapshpt")
 	}
 
 	kv.shards = stateMachine
 	kv.duplicateTable = dupTable
+	kv.currentConfig = currentConfig
+	kv.prevConfig = prevConfig
 }

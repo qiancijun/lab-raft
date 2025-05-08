@@ -5,10 +5,11 @@ import (
 	"time"
 )
 
-func (kv *ShardKV) ConfigCommand(command RaftCommand, reply *OpReply) {
-	index, _, isLeader := kv.rf.Start(command)
+func (kv *ShardKV) ConfigCommand(commnd RaftCommand, reply *OpReply) {
+	// 调用 raft，将请求存储到 raft 日志中并进行同步
+	index, _, isLeader := kv.rf.Start(commnd)
 
-	// 如果不是 Leader，让客户端去重试
+	// 如果不是 Leader 的话，直接返回错误
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -27,7 +28,6 @@ func (kv *ShardKV) ConfigCommand(command RaftCommand, reply *OpReply) {
 		reply.Err = ErrTimeout
 	}
 
-	// 处理完 channel 就没有用了，可以异步的去删除
 	go func() {
 		kv.mu.Lock()
 		kv.removeNotifyChannel(index)
@@ -43,6 +43,9 @@ func (kv *ShardKV) handleConfigChangeMessage(command RaftCommand) *OpReply {
 	case ShardMigration:
 		shardData := command.Data.(ShardOperationReply)
 		return kv.applyShardMigration(&shardData)
+	case ShardGC:
+		shardsInfo := command.Data.(ShardOperationArgs)
+		return kv.applyShardGC(&shardsInfo)
 	default:
 		panic("unknown config change type")
 	}
@@ -50,23 +53,19 @@ func (kv *ShardKV) handleConfigChangeMessage(command RaftCommand) *OpReply {
 
 func (kv *ShardKV) applyNewConfig(newConfig shardctrler.Config) *OpReply {
 	if kv.currentConfig.Num+1 == newConfig.Num {
-		// 判断配置是不是匹配
 		for i := 0; i < shardctrler.NShards; i++ {
-			if kv.currentConfig.Shards[i] == kv.gid && newConfig.Shards[i] != kv.gid {
-				// 当前的 shard 属于当前的 group，但是在下一个 config 中不属于
-				// 该 shard 需要迁移出去
+			if kv.currentConfig.Shards[i] != kv.gid && newConfig.Shards[i] == kv.gid {
+				//	shard 需要迁移进来
 				gid := kv.currentConfig.Shards[i]
 				if gid != 0 {
-					kv.shards[i].Status = MoveOut
+					kv.shards[i].Status = MoveIn
 				}
 			}
-
-			if kv.currentConfig.Shards[i] != kv.gid && newConfig.Shards[i] == kv.gid {
-				// 当前的 shard 不属于当前的 group，但是在下一个 config 中属于
-				// 该 shard 需要迁移进来
+			if kv.currentConfig.Shards[i] == kv.gid && newConfig.Shards[i] != kv.gid {
+				// shard 需要迁移出去
 				gid := newConfig.Shards[i]
 				if gid != 0 {
-					kv.shards[i].Status = MoveIn
+					kv.shards[i].Status = MoveOut
 				}
 			}
 		}
@@ -93,7 +92,7 @@ func (kv *ShardKV) applyShardMigration(shardDataReply *ShardOperationReply) *OpR
 			}
 		}
 
-		// 拷贝去重表
+		// 拷贝去重表数据
 		for clientId, dupTable := range shardDataReply.DuplicateTable {
 			table, ok := kv.duplicateTable[clientId]
 			if !ok || table.SeqId < dupTable.SeqId {
@@ -101,7 +100,21 @@ func (kv *ShardKV) applyShardMigration(shardDataReply *ShardOperationReply) *OpR
 			}
 		}
 	}
-	return &OpReply{
-		Err: ErrWrongConfig,
+	return &OpReply{Err: ErrWrongConfig}
+}
+
+func (kv *ShardKV) applyShardGC(shardsInfo *ShardOperationArgs) *OpReply {
+	if shardsInfo.ConfigNum == kv.currentConfig.Num {
+		for _, shardId := range shardsInfo.ShardIds {
+			shard := kv.shards[shardId]
+			if shard.Status == GC {
+				shard.Status = Normal
+			} else if shard.Status == MoveOut {
+				kv.shards[shardId] = NewMemoryKVStateMachine()
+			} else {
+				break
+			}
+		}
 	}
+	return &OpReply{Err: OK}
 }
